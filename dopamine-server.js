@@ -1,309 +1,360 @@
-/**
- * Dopamine JVC — Webhook Server
- * 
- * Запуск:
- *   npm install express cors
- *   node dopamine-server.js
- * 
- * Или с автоперезапуском:
- *   npm install -g nodemon
- *   nodemon dopamine-server.js
- * 
- * Порт по умолчанию: 3001
- * Вебхук URL для Langame: http://YOUR_IP:3001/webhook/langame
- */
+require("dotenv").config();
 
-const express = require('express');
-const cors    = require('cors');
-const app     = express();
-const PORT    = process.env.PORT || 3001;
+const express = require("express");
+const cors = require("cors");
 
+const { supabase, ping: supabasePing } = require("./lib/supabase");
+const { complete: aiComplete, ping: anthropicPing, DEFAULT_MODEL, FAST_MODEL } = require("./lib/anthropic");
+
+const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// ============================================================
-// IN-MEMORY STATE  (заменяется при каждом push от Langame)
-// ============================================================
-let STATE = {
-  lastUpdate: null,
-  hall: {
-    sessions: [],     // активные сессии
-    bookings: [],     // брони на сегодня
-    zones: {          // загрузка зон
-      Comfort: { occupied: 0, capacity: 20 },
-      BC:      { occupied: 0, capacity: 12 },
-      VIP2K:   { occupied: 0, capacity: 11 },
-      VIP4K:   { occupied: 0, capacity: 5  },
-      PS:      { occupied: 0, capacity: 4  }
-    }
-  },
-  currentAdmin: null  // кто сейчас на смене (из Langame логина)
-};
+// ---------------------------------------------------------------------------
+// SSE: real-time события для прототипа v7
+// ---------------------------------------------------------------------------
 
-// SSE clients (подключённые браузеры)
-let clients = [];
+const clients = new Set();
+const ALLOWED = new Set([
+  "sessions_update",
+  "bookings_update",
+  "hall_snapshot",
+  "admin_login",
+  "admin_logout",
+  "shift_close",
+  "external_event",
+]);
 
-// ============================================================
-// SSE — отправить всем подключённым браузерам
-// ============================================================
-function broadcast(eventName, data) {
-  const msg = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
-  clients = clients.filter(res => {
-    try { res.write(msg); return true; }
-    catch(e) { return false; }
-  });
-  console.log(`[SSE] broadcast "${eventName}" → ${clients.length} clients`);
+function broadcast(payload) {
+  const message = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of clients) res.write(message);
 }
 
-// ============================================================
-// SSE ENDPOINT  (браузер подключается сюда)
-// GET /events
-// ============================================================
-app.get('/events', (req, res) => {
-  res.setHeader('Content-Type',  'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection',    'keep-alive');
-  res.flushHeaders();
+// ---------------------------------------------------------------------------
+// HEALTH
+// ---------------------------------------------------------------------------
 
-  // Сразу отдать текущее состояние
-  res.write(`event: init\ndata: ${JSON.stringify(STATE)}\n\n`);
+app.get("/health", (_req, res) => res.json({ ok: true, clients: clients.size }));
 
-  clients.push(res);
-  console.log(`[SSE] client connected (total: ${clients.length})`);
-
-  // Пинг каждые 25 сек чтобы соединение не падало
-  const ping = setInterval(() => {
-    try { res.write(': ping\n\n'); } catch(e) {}
-  }, 25000);
-
-  req.on('close', () => {
-    clearInterval(ping);
-    clients = clients.filter(c => c !== res);
-    console.log(`[SSE] client disconnected (total: ${clients.length})`);
+app.get("/health/full", async (_req, res) => {
+  const [sb, an] = await Promise.all([supabasePing(), anthropicPing()]);
+  const ok = sb.ok && an.ok;
+  res.status(ok ? 200 : 503).json({
+    ok,
+    clients: clients.size,
+    supabase: sb,
+    anthropic: an,
+    models: { default: DEFAULT_MODEL, fast: FAST_MODEL },
+    uptime_sec: Math.round(process.uptime()),
   });
 });
 
-// ============================================================
-// REST — получить текущее состояние (для polling fallback)
-// GET /api/state
-// ============================================================
-app.get('/api/state', (req, res) => {
-  res.json(STATE);
+// ---------------------------------------------------------------------------
+// SSE-канал
+// ---------------------------------------------------------------------------
+
+app.get("/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  res.write("retry: 3000\n\n");
+  clients.add(res);
+
+  req.on("close", () => {
+    clients.delete(res);
+  });
 });
 
-// ============================================================
-// WEBHOOK — Langame отправляет данные сюда
-// POST /webhook/langame
-//
-// Ожидаемые форматы:
-// 1. Полный снапшот зала:
-//    { type: "hall_snapshot", sessions: [...], bookings: [...], admin: {...} }
-//
-// 2. Только сессии:
-//    { type: "sessions_update", sessions: [...] }
-//
-// 3. Только брони:
-//    { type: "bookings_update", bookings: [...] }
-//
-// 4. Логин/выход администратора:
-//    { type: "admin_login",  admin: { name, login, shiftType } }
-//    { type: "admin_logout", admin: { name, login } }
-//
-// 5. Закрытие смены:
-//    { type: "shift_close", admin: { name }, revenue: 12000, barRevenue: 1500 }
-// ============================================================
-app.post('/webhook/langame', (req, res) => {
-  const { type, ...payload } = req.body;
-  const ts = new Date().toISOString();
+// ---------------------------------------------------------------------------
+// Webhook от Langame (как было)
+// ---------------------------------------------------------------------------
 
-  console.log(`[WEBHOOK] ${ts} type="${type}"`, JSON.stringify(payload).slice(0, 200));
+app.post("/webhook/langame", (req, res) => {
+  const event = req.body || {};
+  if (!ALLOWED.has(event.type)) {
+    return res.status(400).json({ ok: false, error: "Unsupported event type" });
+  }
+  broadcast(event);
+  return res.json({ ok: true });
+});
 
-  if (!type) {
-    return res.status(400).json({ error: 'Missing type field' });
+// ---------------------------------------------------------------------------
+// Webhook от внешних продуктов Dopamine (LMS, видео-аудио мониторинг и т.п.)
+// ---------------------------------------------------------------------------
+//
+// Контракт (минимально):
+// {
+//   "source": "lms" | "video_audio" | "service_inspector" | ...,
+//   "type": "exam_passed" | "upsell_missed" | "checklist_review" | ...,
+//   "club": "JVC" | "JBR",
+//   "occurred_at": "ISO8601",
+//   "subject": { ... }   // про кого/что
+//   "payload": { ... }   // произвольные данные источника
+// }
+//
+// Сервер:
+//  1) Записывает в таблицу external_events (если Supabase настроен).
+//  2) Транслирует в SSE как { type: "external_event", ... } — UI решит, что показать.
+// ---------------------------------------------------------------------------
+
+app.post("/webhook/external", async (req, res) => {
+  const body = req.body || {};
+  const required = ["source", "type", "club"];
+  const missing = required.filter((k) => !body[k]);
+  if (missing.length) {
+    return res.status(400).json({ ok: false, error: "missing_fields", missing });
   }
 
-  STATE.lastUpdate = ts;
+  const occurredAt = body.occurred_at || new Date().toISOString();
+  const sev = body.severity && ["low", "medium", "high"].includes(body.severity) ? body.severity : null;
 
-  switch (type) {
+  const event = {
+    source: String(body.source),
+    event_type: String(body.type),
+    club_id: String(body.club).toUpperCase(),
+    employee_id: body.employee_id || null,
+    zone: body.zone || null,
+    severity: sev,
+    details: body.details || body.payload || null,
+    recommended_action: body.recommended_action || null,
+    target_role: body.target_role || null,
+    occurred_at: occurredAt,
+  };
 
-    case 'hall_snapshot': {
-      // Полный снапшот: сессии + брони + инфо о смене
-      if (payload.sessions) {
-        STATE.hall.sessions = normalizeSessions(payload.sessions);
-        recalcZones();
-      }
-      if (payload.bookings) {
-        STATE.hall.bookings = normalizeBookings(payload.bookings);
-      }
-      if (payload.admin) {
-        STATE.currentAdmin = payload.admin;
-      }
-      broadcast('hall_snapshot', STATE);
-      break;
+  let saved = null;
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("external_events")
+      .insert(event)
+      .select("id")
+      .single();
+    if (error) {
+      console.error("[external] supabase insert error:", error.message);
+      return res.status(500).json({ ok: false, error: "db_error", detail: error.message });
     }
-
-    case 'sessions_update': {
-      STATE.hall.sessions = normalizeSessions(payload.sessions || []);
-      recalcZones();
-      broadcast('sessions_update', {
-        sessions: STATE.hall.sessions,
-        zones: STATE.hall.zones,
-        lastUpdate: ts
-      });
-      break;
-    }
-
-    case 'bookings_update': {
-      STATE.hall.bookings = normalizeBookings(payload.bookings || []);
-      broadcast('bookings_update', {
-        bookings: STATE.hall.bookings,
-        lastUpdate: ts
-      });
-      break;
-    }
-
-    case 'admin_login': {
-      STATE.currentAdmin = payload.admin || null;
-      broadcast('admin_login', {
-        admin: STATE.currentAdmin,
-        lastUpdate: ts
-      });
-      break;
-    }
-
-    case 'admin_logout': {
-      STATE.currentAdmin = null;
-      broadcast('admin_logout', { lastUpdate: ts });
-      break;
-    }
-
-    case 'shift_close': {
-      // Langame закрыл смену — сообщаем браузеру
-      broadcast('shift_close', {
-        admin:      payload.admin,
-        revenue:    payload.revenue    || 0,
-        barRevenue: payload.barRevenue || 0,
-        lastUpdate: ts
-      });
-      // Сбросить текущего администратора
-      STATE.currentAdmin = null;
-      break;
-    }
-
-    default: {
-      console.warn(`[WEBHOOK] Unknown type: ${type}`);
-      return res.status(400).json({ error: `Unknown type: ${type}` });
-    }
+    saved = data;
+  } else {
+    console.warn("[external] supabase not configured, event NOT persisted:", event);
   }
 
-  res.json({ ok: true, type, timestamp: ts });
-});
-
-// ============================================================
-// ТЕСТОВЫЙ ЭНДПОИНТ — имитировать push от Langame
-// POST /test/push
-// { "type": "sessions_update", "sessions": [...] }
-// ============================================================
-app.post('/test/push', (req, res) => {
-  // Просто перенаправляем в /webhook/langame
-  req.url = '/webhook/langame';
-  app.handle(req, res);
-});
-
-// ============================================================
-// ТЕСТОВЫЙ СНАПШОТ — заполнить демо-данными
-// GET /test/demo
-// ============================================================
-app.get('/test/demo', (req, res) => {
-  STATE.hall.sessions = [
-    { pc: 6,  guestName: 'Jorge Villanueva', phone4: '1258', tariff: '3h Pack',     endTime: Date.now() + 84*60000,  zone: 'Comfort' },
-    { pc: 15, guestName: 'Rami Sabayon',     phone4: '4020', tariff: 'Evening Pack', endTime: Date.now() + 227*60000, zone: 'Comfort' },
-    { pc: 11, guestName: null,               phone4: '3841', tariff: 'Hourly',       endTime: null,                   zone: 'Comfort' },
-    { pc: 24, guestName: 'Marwan Helmy',     phone4: '6362', tariff: '5h Pack',      endTime: Date.now() + 252*60000, zone: 'BC',     hasBooking: true },
-    { pc: 38, guestName: 'Malik Ivanov',     phone4: '9246', tariff: '3h Pack',      endTime: Date.now() + 22*60000,  zone: 'VIP2K',  hasBooking: true },
-    { pc: 44, guestName: 'Raif Al Hamed',   phone4: '0397', tariff: 'Evening Pack', endTime: Date.now() + 175*60000, zone: 'VIP4K'  }
-  ];
-  STATE.hall.bookings = [
-    { guestName: 'Adam Hamed',  phone4: '4691', zone: 'Comfort', pc: 30, timeFrom: '11:00', timeTo: '14:00' },
-    { guestName: null,           phone4: '5521', zone: 'Comfort', pc: 7,  timeFrom: '12:30', timeTo: '17:30' },
-    { guestName: 'Delvin Swart', phone4: '2733', zone: 'Comfort', pc: 5,  timeFrom: '14:00', timeTo: '19:00' },
-    { guestName: 'Корпоратив',   phone4: null,   zone: 'Comfort', pcs: [1,2,3,4,5], timeFrom: '18:00', timeTo: '23:00', isGroup: true }
-  ];
-  STATE.currentAdmin = { name: 'Олег Павлов', login: 'oleg', shiftType: 'Дневная', shiftHours: '09:00–21:00' };
-  STATE.lastUpdate = new Date().toISOString();
-  recalcZones();
-  broadcast('hall_snapshot', STATE);
-  res.json({ ok: true, message: 'Demo data pushed to all clients', clients: clients.length });
-});
-
-// Healthcheck
-app.get('/health', (req, res) => {
-  res.json({ ok: true, clients: clients.length, lastUpdate: STATE.lastUpdate });
-});
-
-// ============================================================
-// HELPERS
-// ============================================================
-function normalizeSessions(sessions) {
-  return sessions.map(s => ({
-    pc:          s.pc          || s.computer || 0,
-    guestName:   s.guestName   || s.name     || null,
-    phone4:      s.phone4      || (s.phone ? String(s.phone).slice(-4) : null),
-    tariff:      s.tariff      || s.package  || 'Hourly',
-    endTime:     s.endTime     || (s.endsAt ? new Date(s.endsAt).getTime() : null),
-    zone:        s.zone        || detectZone(s.pc || s.computer || 0),
-    hasBooking:  s.hasBooking  || false
-  }));
-}
-
-function normalizeBookings(bookings) {
-  return bookings.map(b => ({
-    guestName: b.guestName || b.name || null,
-    phone4:    b.phone4    || (b.phone ? String(b.phone).slice(-4) : null),
-    zone:      b.zone      || 'Comfort',
-    pc:        b.pc        || b.computer || null,
-    pcs:       b.pcs       || null,
-    timeFrom:  b.timeFrom  || b.from    || '—',
-    timeTo:    b.timeTo    || b.to      || '—',
-    isGroup:   b.isGroup   || (b.pcs && b.pcs.length > 1) || false
-  }));
-}
-
-function detectZone(pc) {
-  if (pc >= 1  && pc <= 20) return 'Comfort';
-  if (pc >= 21 && pc <= 32) return 'BC';
-  if (pc >= 33 && pc <= 43) return 'VIP2K';
-  if (pc >= 44 && pc <= 48) return 'VIP4K';
-  return 'PS';
-}
-
-function recalcZones() {
-  // Сбросить
-  Object.keys(STATE.hall.zones).forEach(z => {
-    STATE.hall.zones[z].occupied = 0;
+  broadcast({
+    type: "external_event",
+    source: event.source,
+    event_type: event.event_type,
+    club: event.club_id,
+    occurred_at: event.occurred_at,
+    severity: event.severity,
+    target_role: event.target_role,
   });
-  // Посчитать
-  STATE.hall.sessions.forEach(s => {
-    const z = s.zone;
-    if (STATE.hall.zones[z]) STATE.hall.zones[z].occupied++;
-  });
-}
 
-// ============================================================
-// START
-// ============================================================
-app.listen(PORT, () => {
-  console.log('');
-  console.log('╔════════════════════════════════════════╗');
-  console.log('║   Dopamine Admin — Webhook Server      ║');
-  console.log('╚════════════════════════════════════════╝');
-  console.log('');
-  console.log(`  Server:    http://localhost:${PORT}`);
-  console.log(`  Webhook:   POST http://localhost:${PORT}/webhook/langame`);
-  console.log(`  Events:    GET  http://localhost:${PORT}/events  (SSE)`);
-  console.log(`  Health:    GET  http://localhost:${PORT}/health`);
-  console.log(`  Demo push: GET  http://localhost:${PORT}/test/demo`);
-  console.log('');
-  console.log('  Waiting for connections...');
-  console.log('');
+  return res.json({ ok: true, id: saved?.id || null });
+});
+
+// ---------------------------------------------------------------------------
+// AI: краткое резюме по одному ПК (тикеты + жалобы)
+// ---------------------------------------------------------------------------
+//
+// POST /ai/summary
+// body: { club: "JVC", pc_number: 25, days: 30 }
+// Берём последние тикеты и жалобы по этому ПК → отдаём в Claude → возвращаем
+// плотный текст с тремя блоками: что происходит / что чинили / что делать.
+// ---------------------------------------------------------------------------
+
+app.post("/ai/summary", async (req, res) => {
+  if (!supabase) return res.status(503).json({ ok: false, error: "supabase_not_configured" });
+
+  const { club, pc_number, days = 30 } = req.body || {};
+  if (!club || pc_number === undefined || pc_number === null) {
+    return res.status(400).json({ ok: false, error: "missing_fields", required: ["club", "pc_number"] });
+  }
+
+  const clubUp = String(club).toUpperCase();
+  const pcNum = Number(pc_number);
+  if (!Number.isInteger(pcNum)) {
+    return res.status(400).json({ ok: false, error: "pc_number_must_be_integer" });
+  }
+
+  const since = new Date(Date.now() - Number(days) * 24 * 60 * 60 * 1000).toISOString();
+
+  const { data: tickets, error: tErr } = await supabase
+    .from("tickets")
+    .select("id, created_at, status, severity, priority, component, problem, notes, resolved_at")
+    .eq("club_id", clubUp)
+    .eq("pc_number", pcNum)
+    .gte("created_at", since)
+    .order("created_at", { ascending: false })
+    .limit(50);
+
+  if (tErr) return res.status(500).json({ ok: false, error: "db_error", detail: tErr.message });
+
+  const { data: complaints, error: cErr } = await supabase
+    .from("guest_complaints")
+    .select("id, occurred_at, status, message, guest_name")
+    .eq("club_id", clubUp)
+    .eq("pc_number", pcNum)
+    .gte("occurred_at", since)
+    .order("occurred_at", { ascending: false })
+    .limit(20);
+
+  if (cErr) return res.status(500).json({ ok: false, error: "db_error", detail: cErr.message });
+
+  if ((tickets?.length || 0) === 0 && (complaints?.length || 0) === 0) {
+    return res.json({
+      ok: true,
+      empty: true,
+      summary: `За ${days} дней по ПК ${pcNum} (${clubUp}) нет ни одного тикета и ни одной жалобы. Машина работает чисто.`,
+    });
+  }
+
+  const userPrompt = [
+    `Клуб: ${clubUp}. ПК №${pcNum}. Период: последние ${days} дней.`,
+    ``,
+    `ТИКЕТЫ (${tickets?.length || 0}):`,
+    JSON.stringify(tickets || [], null, 2),
+    ``,
+    `ЖАЛОБЫ ГОСТЕЙ (${complaints?.length || 0}):`,
+    JSON.stringify(complaints || [], null, 2),
+    ``,
+    `Сделай краткое резюме на 5–8 строк по структуре:`,
+    `1) ЧТО ПРОИСХОДИТ — какие 1–3 проблемы повторяются (компонент + симптом).`,
+    `2) ЧТО ЧИНИЛИ — есть ли одинаковые ремонты подряд (= техподдержка не лечит корень).`,
+    `3) ЧТО ДЕЛАТЬ — 1–2 конкретных следующих шага.`,
+    `Без воды. На русском.`,
+  ].join("\n");
+
+  const ai = await aiComplete({
+    system: "Ты технический аналитик компьютерного клуба. Пишешь сухо и по делу, цифрами.",
+    user: userPrompt,
+    maxTokens: 600,
+  });
+
+  if (!ai.ok) return res.status(502).json({ ok: false, error: "ai_failed", detail: ai.error });
+
+  return res.json({
+    ok: true,
+    club: clubUp,
+    pc_number: pcNum,
+    period_days: days,
+    counts: { tickets: tickets?.length || 0, complaints: complaints?.length || 0 },
+    model: ai.model,
+    summary: ai.text,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI: общий анализ парка (агрегаты по клубу)
+// ---------------------------------------------------------------------------
+//
+// POST /ai/parc-analysis
+// body: { club: "JVC", days: 30 }
+// Группирует тикеты/жалобы за период и просит Claude выделить
+// топ-3 проблемных ПК и системные паттерны (не разовые).
+// ---------------------------------------------------------------------------
+
+app.post("/ai/parc-analysis", async (req, res) => {
+  if (!supabase) return res.status(503).json({ ok: false, error: "supabase_not_configured" });
+
+  const { club, days = 30 } = req.body || {};
+  if (!club) return res.status(400).json({ ok: false, error: "missing_fields", required: ["club"] });
+
+  const since = new Date(Date.now() - Number(days) * 24 * 60 * 60 * 1000).toISOString();
+  const clubUp = String(club).toUpperCase();
+
+  const { data: tickets, error: tErr } = await supabase
+    .from("tickets")
+    .select("pc_number, zone_name, status, severity, component, problem, created_at")
+    .eq("club_id", clubUp)
+    .gte("created_at", since)
+    .limit(500);
+  if (tErr) return res.status(500).json({ ok: false, error: "db_error", detail: tErr.message });
+
+  const { data: complaints, error: cErr } = await supabase
+    .from("guest_complaints")
+    .select("pc_number, message, occurred_at, status")
+    .eq("club_id", clubUp)
+    .gte("occurred_at", since)
+    .limit(500);
+  if (cErr) return res.status(500).json({ ok: false, error: "db_error", detail: cErr.message });
+
+  const byPc = {};
+  for (const t of tickets || []) {
+    if (t.pc_number == null) continue;
+    const k = String(t.pc_number);
+    byPc[k] = byPc[k] || { tickets: 0, complaints: 0, components: {}, problems: [], zone: t.zone_name };
+    byPc[k].tickets += 1;
+    if (t.component) byPc[k].components[t.component] = (byPc[k].components[t.component] || 0) + 1;
+    if (t.problem) byPc[k].problems.push(t.problem);
+  }
+  for (const c of complaints || []) {
+    if (c.pc_number == null) continue;
+    const k = String(c.pc_number);
+    byPc[k] = byPc[k] || { tickets: 0, complaints: 0, components: {}, problems: [], zone: null };
+    byPc[k].complaints += 1;
+  }
+
+  const aggregate = Object.entries(byPc)
+    .map(([pc_number, v]) => ({
+      pc_number: Number(pc_number),
+      zone: v.zone,
+      tickets: v.tickets,
+      complaints: v.complaints,
+      total: v.tickets + v.complaints,
+      top_components: Object.entries(v.components)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([c, n]) => ({ component: c, count: n })),
+      sample_problems: v.problems.slice(0, 5),
+    }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 15);
+
+  if (aggregate.length === 0) {
+    return res.json({
+      ok: true,
+      empty: true,
+      summary: `За ${days} дней по ${clubUp} нет тикетов и жалоб. Парк работает чисто.`,
+    });
+  }
+
+  const userPrompt = [
+    `Клуб: ${clubUp}. Период: ${days} дней.`,
+    `Топ ПК по числу инцидентов (тикеты + жалобы):`,
+    JSON.stringify(aggregate, null, 2),
+    ``,
+    `Сделай отчёт на 8–12 строк:`,
+    `1) ТОП-3 ПРОБЛЕМНЫХ ПК — номер, цифры, главный компонент, краткое "почему".`,
+    `2) ПАТТЕРНЫ — есть ли одинаковые проблемы на разных машинах (один тип компонента, одна зона). Не выдумывай.`,
+    `3) РЕКОМЕНДАЦИИ — 3 конкретных действия для менеджера на эту неделю.`,
+    `Если паттернов нет — так и пиши. На русском.`,
+  ].join("\n");
+
+  const ai = await aiComplete({
+    system: "Ты аналитик IT-инфраструктуры компьютерного клуба. Цифры важнее эмоций.",
+    user: userPrompt,
+    maxTokens: 900,
+  });
+
+  if (!ai.ok) return res.status(502).json({ ok: false, error: "ai_failed", detail: ai.error });
+
+  return res.json({
+    ok: true,
+    club: clubUp,
+    period_days: days,
+    top_pc: aggregate.slice(0, 5),
+    counts: { tickets: tickets?.length || 0, complaints: complaints?.length || 0 },
+    model: ai.model,
+    summary: ai.text,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Старт
+// ---------------------------------------------------------------------------
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`dopamine-server listening on :${port}`);
+  console.log(`  supabase:  ${supabase ? "configured" : "NOT configured"}`);
+  console.log(`  anthropic: ${process.env.ANTHROPIC_API_KEY ? "configured" : "NOT configured"}`);
 });
